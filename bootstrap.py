@@ -181,14 +181,6 @@ def print_completion(message='Done!'):
     print(u'\u2713 {}\n'.format(message))
 
 
-def pause(seconds):
-    """
-    To pause the process after printing a stop-watch followed by a message to inform how many seconds delay is expected
-    """
-    print(u'\n\u2A36 Pausing for {} seconds'.format(seconds))
-    time.sleep(seconds)
-
-
 # === AWS Tasks ===
 
 def client(resource,
@@ -315,8 +307,20 @@ def create_user(user_name):
                 )
             )
 
+        print(u'\u2A36 Wait for user to be created')
+
+        waiter = client("iam", ACCOUNTS["identity"]).get_waiter('user_exists')
+
+        waiter.wait(
+            UserName=user_name,
+            WaiterConfig={
+                'Delay': 5,
+                'MaxAttempts': 5
+            }
+        )
+
         print_completion()
-        pause(10)
+
     except ClientError as err:
         if err.response['Error']['Code'] == 'EntityAlreadyExists':
 
