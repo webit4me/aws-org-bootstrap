@@ -1,20 +1,26 @@
 #!/usr/bin/env python
 
-"""setup_org_accounts.py will create required read-only and write roles on different organisation accounts"""
+"""
+This script uses an AWS organisation admin account to create the following entities,
+    to enable managing/configuringorganisation's sub accounts by terraform:
+    - Terraform's backend's S3 bucket, in management account
+    - Terraform's user in Identity account
+    - Admin, assumable IAM roles by terraform's user, across all of the organisation's sub accounts,
+      including, management and identity accounts
+"""
+
+__author__ = 'Ali Bahman'
+__copyright__ = 'Copyright 2019, AWS Organisation Bootstrap'
+__credits__ = ['Max Edwards']
+__license__ = '{license}'
+__version__ = '0.0.1'
+__maintainer__ = 'Ali Bahman'
+__email__ = 'abn@webit4.me'
+__status__ = 'Pre-alpha'
 
 import argparse
 import json
-import time
 from datetime import date, datetime
-
-
-def abort_setup(message="Aborting setup!", exit_code=1):
-    """
-    Print a cross mark followed by "Aborting setup!" or any given string and exit with code 1 or the provided exit_code
-    """
-    print(u'\n\u2717 {}'.format(message))
-    exit(exit_code)
-
 
 try:
     import boto3
@@ -24,21 +30,20 @@ except ModuleNotFoundError as err:
     print('Have you setup virtual environment and installed required modules as described in the README.md file?')
     abort_setup()
 
-__author__ = '{author}'
-__copyright__ = 'Copyright {year}, {project_name}'
-__credits__ = ['{credit_list}']
-__license__ = '{license}'
-__version__ = '{mayor}.{minor}.{rel}'
-__maintainer__ = '{maintainer}'
-__email__ = '{contact_email}'
-__status__ = '{dev_status}'
+DEFAULT_BUCKET_NAME = "terraform-backend-bucket"
+DEFAULT_CI_USERNAME = "ci"
+DEFAULT_CI_USER_POLICY = "allow_assume_role"
+DEFAULT_CI_ROLE_NAME = "ci"
+DEFAULT_AWS_REGION = "eu-west-1"
+DEFAULT_AWS_ORG_ACCESS_ROLE = "OrganizationAccountAccessRole"
+DEFAULT_ADMIN_POLICY_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
+STORE_CREDENTIALS_AT = "credentials.txt"
 
 # === Gather required and optional arguments
 PARSER = argparse.ArgumentParser(
     description="Create required read-only and write roles on different organisation accounts"
 )
 
-# conflicting_group = parser.add_mutually_exclusive_group()
 PARSER.add_argument(
     "-c",
     "--check-accounts",
@@ -56,67 +61,55 @@ PARSER.add_argument(
     "-g", "--aws-region",
     help="AWS region name",
     action="store_true",
-    default="eu-west-1"
+    default=DEFAULT_AWS_REGION
 )
 
 PARSER.add_argument(
     "organisation-admin-profile-name",
     help="AWS profile name, belongs to the organisation's admin to be used when assuming "
-         "roles in other accounts to take required actions"
+         "roles in other accounts to perform required actions, such as creating IAM user and roles"
 )
 
 PARSER.add_argument(
     "identity-account-id",
-    help="identity account ID to host all users. i.e. terraform user to assume roles on other accounts to operate"
+    help="Identity account ID to host terraform's IAM user"
 )
 
 PARSER.add_argument(
     "management-account-id",
-    help="management account ID to host shared components such as terraform's backend bucket, certificates, etc."
+    help="Management account ID to host terraform's backend S3 bucket and its assumable role"
 )
 
 PARSER.add_argument(
-    "path-to-live-account-ids",
-    help="comma separated AWS account IDs to create their read-only and write roles, "
-         "i.e. development, pre-production and production accounts")
+    "org-sub-account-ids",
+    help="Comma separated AWS account IDs to host system admin's roles, assumable by terraform's user "
+         "i.e. development, pre-production and production accounts"
+)
 
 PARSER.add_argument(
     "-r", "--role",
-    help="existing role to be assumed within management and sub accounts from the organisation account.",
-    default="OrganizationAccountAccessRole"
+    help="Existing IAM role to be assumed to operate within sub accounts from the organisation account.",
+    default=DEFAULT_AWS_ORG_ACCESS_ROLE
 )
 
 PARSER.add_argument(
     "-s", "--s3-bucket-name",
     help="terraform's backend 3S bucket's name, to be created on the management account",
-    default="w4m-terraform-backend"
+    default=DEFAULT_BUCKET_NAME
 )
 
 PARSER.add_argument(
     "-u", "--username",
     help="A username to be created in the identity account",
-    default="terraform"
-)
-
-PARSER.add_argument(
-    "-v",
-    "--verbose",
-    help="increase output verbosity",
-    action="store_true"
+    default=DEFAULT_CI_USERNAME
 )
 
 # === Global variables/constants
 ARGS = PARSER.parse_args()
 AWS_REGION = ARGS.__getattribute__("aws_region")
-CREDENTIALS_FILE_NAME = "credentials.txt"
-DEBUGGING_SUFFIX = ""
-MANAGEMENT_READ_POLICY_ARN = "arn:aws:iam::aws:policy/ReadOnlyAccess"
-MANAGEMENT_READ_ROLE_NAME = "account-read{}".format(DEBUGGING_SUFFIX)
-MANAGEMENT_WRITE_POLICY_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
-MANAGEMENT_WRITE_ROLE_NAME = "account-write{}".format(DEBUGGING_SUFFIX)
 ORGANISATION_ACCESS_ROLE = ARGS.__getattribute__("role")
 ORGANISATION_PROFILE_NAME = ARGS.__getattribute__("organisation-admin-profile-name")
-PATH_TO_LIVE_ACCOUNT_IDS = ARGS.__getattribute__("path-to-live-account-ids").split(",")
+ORG_SUB_ACCOUNT_IDS = ARGS.__getattribute__("org-sub-account-ids").split(",")
 S3_BUCKET_NAME = ARGS.__getattribute__("s3_bucket_name")
 USERNAME = ARGS.__getattribute__("username")
 
@@ -126,7 +119,10 @@ ACCOUNTS = {
     'identity': ARGS.__getattribute__("identity-account-id")
 }
 
-ASSUMABLE_ROLE_TEMPLATE = {
+for account_id in ORG_SUB_ACCOUNT_IDS:
+    ACCOUNTS["path-to-live-{}".format(ORG_SUB_ACCOUNT_IDS.index(account_id) + 1)] = account_id
+
+CI_ROLE_POLICY_DOC_TEMPLATE = {
     "Version": "2012-10-17",
     "Statement": {
         "Action": "sts:AssumeRole",
@@ -136,12 +132,13 @@ ASSUMABLE_ROLE_TEMPLATE = {
     }
 }
 
-USER_ASSUME_ROLE_TEMPLATE = {
+CI_USER_POLICY_DOC_TEMPLATE = {
     "Version": "2012-10-17",
     "Statement": {
+        "Sid": "VisualEditor0",
         "Effect": "Allow",
         "Action": "sts:AssumeRole",
-        "Resource": []
+        "Resource": [],
     }
 }
 
@@ -150,30 +147,22 @@ AWS_CREDENTIAL_TEMPLATE = "\n\n# Put the following in AWS credentials file, i.e.
                           "aws_access_key_id = {}\n" \
                           "aws_secret_access_key = {}\n"
 
-for account_id in PATH_TO_LIVE_ACCOUNT_IDS:
-    ACCOUNTS["path-to-live-{}".format(PATH_TO_LIVE_ACCOUNT_IDS.index(account_id) + 1)] = account_id
-
 
 # === Common methods ===
+
+def abort_setup(message="Aborting setup!", exit_code=1):
+    """
+    Print a cross mark followed by "Aborting setup!" or any given string and exit with code 1 or the provided exit_code
+    """
+    print(u'\n\u2717 {}'.format(message))
+    exit(exit_code)
+
+
 def json_serial(obj):
     """Custom JSON serializer to handle date correctly"""
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     raise TypeError("Type %s not serializable" % type(obj))
-
-
-def json_print(message, default=json_serial, indent=4, separators=(',', ': ')):
-    """ Generic printer, capable of pretty printing JSON including date & datetime objects"""
-    print(json.dumps(message,
-                     default=default,
-                     indent=indent,
-                     separators=separators))
-
-
-def report(message):
-    """ Use p() to print the given message only if verbose flag is set """
-    if ARGS.dry_run or ARGS.verbose:
-        print(message)
 
 
 def print_completion(message='Done!'):
@@ -213,11 +202,9 @@ def check_accounts():
     for account_label, target_account_id in sorted(ACCOUNTS.items()):
         try:
             if account_label == "organization":
-                report("{} (Profile name: {})".format(account_label, target_account_id.get('profile_name')))
                 if not ARGS.dry_run:
                     print_completion(client("iam").list_account_aliases().get("AccountAliases"))
             else:
-                report("{} (Account ID: {})".format(account_label, target_account_id))
                 if not ARGS.dry_run:
                     print_completion(client("iam", target_account_id).list_account_aliases().get("AccountAliases"))
 
@@ -248,9 +235,11 @@ def create_backend_bucket(bucket_name):
         bucket_name,
         target_account_id
     ))
+
     if ARGS.dry_run:
-        print(u'\u2023\u2023\u2023 Skip')
+        print(u'\u2023 Skipped during dry-run \u2023\u2023\u2023')
         return
+
     try:
         client("s3", ACCOUNTS["management"]).create_bucket(
             Bucket=bucket_name,
@@ -277,23 +266,55 @@ def create_backend_bucket(bucket_name):
             abort_setup()
 
 
+def create_and_attach_user_policy(user_name):
+    """
+    :type user_name: str
+    :return: str Policy's ARN
+    """
+    # print('\nAdd inline policy to {} user, in identity account (ID: {})'.format(user_name, ACCOUNTS["identity"]))
+
+    resources = []
+
+    for target_account, target_account_id in ACCOUNTS.items():
+        if target_account in ["organization"]:
+            continue
+
+        resources.append("arn:aws:iam::{}:role/{}".format(target_account_id, DEFAULT_CI_ROLE_NAME))
+
+    CI_USER_POLICY_DOC_TEMPLATE["Statement"]["Resource"] = resources
+
+    print("- Inject user's assumable inline policy")
+
+    client("iam", ACCOUNTS["identity"]).put_user_policy(
+        UserName=user_name,
+        PolicyName=DEFAULT_CI_USER_POLICY,
+        PolicyDocument=json.dumps(CI_USER_POLICY_DOC_TEMPLATE)
+    )
+
+
 def create_user(user_name):
     """
     Create terraform user in identity account
     :param user_name:
     :return:
     """
-    print('\nCreating user "{}" in account "{}"'.format(user_name, ACCOUNTS["identity"]))
+
+    print('\nCreating user "{}" in identity account (ID: {})'.format(user_name, ACCOUNTS["identity"]))
+    if ARGS.dry_run:
+        print(u'\u2023 Skipped during dry-run \u2023\u2023\u2023')
+        return
+
     try:
 
-        response = client("iam", ACCOUNTS["identity"]).create_user(UserName=user_name)
-        ASSUMABLE_ROLE_TEMPLATE["Statement"]["Principal"]["AWS"] = response["User"]["Arn"]
+        user = client("iam", ACCOUNTS["identity"]).create_user(UserName=user_name)
+        CI_ROLE_POLICY_DOC_TEMPLATE["Statement"]["Principal"]["AWS"] = user["User"]["Arn"]
 
+        print("- Generate user's credentials")
         response = client("iam", ACCOUNTS["identity"]).create_access_key(
             UserName=user_name
         )
 
-        with open(CREDENTIALS_FILE_NAME, 'w') as file:
+        with open(STORE_CREDENTIALS_AT, 'w') as file:
             file.write(
                 json.dumps(
                     response.get("AccessKey"),
@@ -319,14 +340,19 @@ def create_user(user_name):
             }
         )
 
+        create_and_attach_user_policy(user_name)
+
         print_completion()
 
     except ClientError as err:
         if err.response['Error']['Code'] == 'EntityAlreadyExists':
 
             response = client("iam", ACCOUNTS["identity"]).get_user(UserName=user_name)
-            ASSUMABLE_ROLE_TEMPLATE["Statement"]["Principal"]["AWS"] = response["User"]["Arn"]
+            CI_ROLE_POLICY_DOC_TEMPLATE["Statement"]["Principal"]["AWS"] = response["User"]["Arn"]
             print("- User already exists >>")
+
+            create_and_attach_user_policy(user_name)
+
         elif err.response['Error']['Code'] == 'InvalidClientTokenId':
             print("- Failed to create user, using defined Key & Secret for account {}!" \
                   "\nMake sure its user has sufficient permission".format(ACCOUNTS["identity"]))
@@ -336,28 +362,45 @@ def create_user(user_name):
             abort_setup()
 
 
-def create_role(tagert_account_id, account_alias, role_name, policy_arn):
+def get_account_alias(account_id):
+    """
+    :param account_id:
+    :return:
+    """
+    paginator = client("iam", account_id).get_paginator('list_account_aliases')
+    for response in paginator.paginate():
+        return response.get('AccountAliases', [account_id])[0]
+
+
+def create_role(target_account_id, account_alias, role_name, policy_arn):
     """
     Create terraform's read and write roles in all accounts
-    :param tagert_account_id:
+    :param target_account_id:
     :param account_alias:
     :param role_name:
     :param policy_arn:
     :return:
     """
     try:
-        assert 'AWS' in ASSUMABLE_ROLE_TEMPLATE.get('Statement').get('Principal'), "Management user's ARN is not " \
-                                                                                   "injected! have you called create " \
-                                                                                   "user first? "
-        print('\nCreating role "{}" in account "{}"'.format(role_name, account_alias))
 
-        role = client("iam", tagert_account_id).create_role(
-            AssumeRolePolicyDocument=json.dumps(ASSUMABLE_ROLE_TEMPLATE),
+        print('\nCreating role "{}" in account {} (ID: {})'.format(role_name, get_account_alias(target_account_id),
+                                                                   account_id))
+
+        if ARGS.dry_run:
+            print(u'\u2023 Skipped during dry-run \u2023\u2023\u2023')
+            return
+
+        assert 'AWS' in CI_ROLE_POLICY_DOC_TEMPLATE.get('Statement').get('Principal'), "Management user's ARN is not " \
+                                                                                       "injected! have you called create " \
+                                                                                       "user first? "
+
+        role = client("iam", target_account_id).create_role(
+            AssumeRolePolicyDocument=json.dumps(CI_ROLE_POLICY_DOC_TEMPLATE),
             Path='/',
             RoleName=role_name,
         )
 
-        client("iam", tagert_account_id).attach_role_policy(
+        client("iam", target_account_id).attach_role_policy(
             RoleName=role_name,
             PolicyArn=policy_arn
         )
@@ -376,36 +419,6 @@ def create_role(tagert_account_id, account_alias, role_name, policy_arn):
             print("Unexpected error: %s" % err)
 
 
-def create_write_role(target_account_id, account_alias):
-    """
-    Create terraform write role in the given account
-    :param target_account_id:
-    :param account_alias:
-    :return:
-    """
-    return create_role(
-        tagert_account_id=target_account_id,
-        account_alias=account_alias,
-        role_name=MANAGEMENT_WRITE_ROLE_NAME,
-        policy_arn=MANAGEMENT_WRITE_POLICY_ARN
-    )
-
-
-def create_read_role(target_account_id, account_alias):
-    """
-    Create terraform read role in the given account
-    :param target_account_id:
-    :param account_alias:
-    :return:
-    """
-    return create_role(
-        tagert_account_id=target_account_id,
-        account_alias=account_alias,
-        role_name=MANAGEMENT_READ_ROLE_NAME,
-        policy_arn=MANAGEMENT_READ_POLICY_ARN
-    )
-
-
 # === PROCESS ===
 
 if ARGS.check_accounts:
@@ -419,5 +432,9 @@ for account, account_id in ACCOUNTS.items():
     if account in ["organization"]:
         continue
 
-    create_write_role(account_id, account)
-    create_read_role(account_id, account)
+    create_role(
+        target_account_id=account_id,
+        account_alias=account,
+        role_name=DEFAULT_CI_ROLE_NAME,
+        policy_arn=DEFAULT_ADMIN_POLICY_ARN
+    )
