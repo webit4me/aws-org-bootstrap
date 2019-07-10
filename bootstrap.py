@@ -20,6 +20,7 @@ __status__ = 'Pre-alpha'
 
 import argparse
 import json
+import time
 from datetime import date, datetime
 
 try:
@@ -32,8 +33,10 @@ except ModuleNotFoundError as err:
 
 DEFAULT_BUCKET_NAME = "terraform-backend-bucket"
 DEFAULT_CI_USERNAME = "ci"
-DEFAULT_CI_USER_POLICY = "allow_assume_role"
+DEFAULT_CI_USER_POLICY_NAME = "allow_assume_role"
 DEFAULT_CI_ROLE_NAME = "ci"
+DEFAULT_TERRAFORM_STATE_ROLE_NAME = "terraform_state"
+DEFAULT_TERRAFORM_BACKEND_DYNAMODB_TABLE_NAME = "terraform_lock"
 DEFAULT_AWS_REGION = "eu-west-1"
 DEFAULT_AWS_ORG_ACCESS_ROLE = "OrganizationAccountAccessRole"
 DEFAULT_ADMIN_POLICY_ARN = "arn:aws:iam::aws:policy/AdministratorAccess"
@@ -142,8 +145,39 @@ CI_USER_POLICY_DOC_TEMPLATE = {
     }
 }
 
+TERRAFORM_STATE_POLICY_DOC_TEMPLATE = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowUserListBucket",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "to-be-overwritten"
+        },
+        {
+            "Sid": "AllowUserAccessToState",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:GetObject"
+            ],
+            "Resource": "to-be-overwritten"
+        },
+        {
+            "Sid": "AllowAccessToDynamoDB",
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:PutItem",
+                "dynamodb:GetItem",
+                "dynamodb:DeleteItem"
+            ],
+            "Resource": "to-be-overwritten"
+        }
+    ]
+}
+
 AWS_CREDENTIAL_TEMPLATE = "\n\n# Put the following in AWS credentials file, i.e. ~/.aws/credentials\n" \
-                          "[{}]\n" \
+                          "[{}]" \
                           "aws_access_key_id = {}\n" \
                           "aws_secret_access_key = {}\n"
 
@@ -154,7 +188,7 @@ def abort_setup(message="Aborting setup!", exit_code=1):
     """
     Print a cross mark followed by "Aborting setup!" or any given string and exit with code 1 or the provided exit_code
     """
-    print(u'\n\u2717 {}'.format(message))
+    print(u'\u2717 {}'.format(message))
     exit(exit_code)
 
 
@@ -197,7 +231,7 @@ def client(resource,
 
 def check_accounts():
     """ Check if it is possible to initiate required sessions to all of the provided organisation's accounts """
-    print("\nChecking access to all accounts:\n")
+    print("Checking access to all accounts:")
 
     for account_label, target_account_id in sorted(ACCOUNTS.items()):
         try:
@@ -212,11 +246,11 @@ def check_accounts():
             if err.response['Error']['Code'] == 'InvalidClientTokenId':
                 if account_label == "organization":
                     print("- Check failed using defined Key & Secret for profile {}!" \
-                          "\nMake sure its user has sufficient permission".format(ORGANISATION_PROFILE_NAME))
+                          "\n  Make sure its user has sufficient permission".format(ORGANISATION_PROFILE_NAME))
                 else:
                     print("- Check failed trying to assume '{}' role on account '{}'!" \
-                          "\nMake sure its user has sufficient permission".format(ORGANISATION_ACCESS_ROLE,
-                                                                                  account_label))
+                          "\n  Make sure its user has sufficient permission".format(ORGANISATION_ACCESS_ROLE,
+                                                                                    account_label))
             else:
                 print("Unexpected error: %s" % err)
 
@@ -231,7 +265,7 @@ def check_accounts():
 def create_backend_bucket(bucket_name):
     """ Create a S3 bucket in the provided management account to be used for terraform backend"""
     target_account_id = ACCOUNTS["management"]
-    print('\nCreating backend\'s S3 bucket "{}" in management account (ID: {})'.format(
+    print('Creating backend\'s S3 bucket "{}" in management account (ID: {})'.format(
         bucket_name,
         target_account_id
     ))
@@ -253,7 +287,7 @@ def create_backend_bucket(bucket_name):
             abort_setup()
         elif err.response['Error']['Code'] == 'InvalidClientTokenId':
             print("- Failed to create S3 bucket, using defined Key & Secret for profile {}!" \
-                  "\nMake sure its user has sufficient permission".format(target_account_id))
+                  "\n  Make sure its user has sufficient permission".format(target_account_id))
             abort_setup()
         elif err.response['Error']['Code'] == 'InvalidAccessKeyId':
             print("- Failed to authenticate credentials provided by {} profile." \
@@ -266,18 +300,20 @@ def create_backend_bucket(bucket_name):
             abort_setup()
 
 
-def create_and_attach_user_policy(user_name):
+def put_ci_user_inline_policy(user_name):
     """
     :type user_name: str
     :return: str Policy's ARN
     """
-    # print('\nAdd inline policy to {} user, in identity account (ID: {})'.format(user_name, ACCOUNTS["identity"]))
 
     resources = []
 
     for target_account, target_account_id in ACCOUNTS.items():
         if target_account in ["organization"]:
             continue
+
+        if target_account in ["management"]:
+            resources.append("arn:aws:iam::{}:role/{}".format(target_account_id, DEFAULT_TERRAFORM_STATE_ROLE_NAME))
 
         resources.append("arn:aws:iam::{}:role/{}".format(target_account_id, DEFAULT_CI_ROLE_NAME))
 
@@ -287,7 +323,7 @@ def create_and_attach_user_policy(user_name):
 
     client("iam", ACCOUNTS["identity"]).put_user_policy(
         UserName=user_name,
-        PolicyName=DEFAULT_CI_USER_POLICY,
+        PolicyName=DEFAULT_CI_USER_POLICY_NAME,
         PolicyDocument=json.dumps(CI_USER_POLICY_DOC_TEMPLATE)
     )
 
@@ -299,7 +335,7 @@ def create_user(user_name):
     :return:
     """
 
-    print('\nCreating user "{}" in identity account (ID: {})'.format(user_name, ACCOUNTS["identity"]))
+    print('Creating user "{}" in identity account (ID: {})'.format(user_name, ACCOUNTS["identity"]))
     if ARGS.dry_run:
         print(u'\u2023 Skipped during dry-run \u2023\u2023\u2023')
         return
@@ -307,6 +343,20 @@ def create_user(user_name):
     try:
 
         user = client("iam", ACCOUNTS["identity"]).create_user(UserName=user_name)
+
+        print(u'\u2A36 Wait for user to be created')
+
+        waiter = client("iam", ACCOUNTS["identity"]).get_waiter('user_exists')
+        waiter.wait(
+            UserName=user_name,
+            WaiterConfig={
+                'Delay': 5,
+                'MaxAttempts': 10
+            }
+        )
+
+        time.sleep(3)
+
         CI_ROLE_POLICY_DOC_TEMPLATE["Statement"]["Principal"]["AWS"] = user["User"]["Arn"]
 
         print("- Generate user's credentials")
@@ -328,19 +378,7 @@ def create_user(user_name):
                 )
             )
 
-        print(u'\u2A36 Wait for user to be created')
-
-        waiter = client("iam", ACCOUNTS["identity"]).get_waiter('user_exists')
-
-        waiter.wait(
-            UserName=user_name,
-            WaiterConfig={
-                'Delay': 5,
-                'MaxAttempts': 5
-            }
-        )
-
-        create_and_attach_user_policy(user_name)
+        put_ci_user_inline_policy(user_name)
 
         print_completion()
 
@@ -351,11 +389,12 @@ def create_user(user_name):
             CI_ROLE_POLICY_DOC_TEMPLATE["Statement"]["Principal"]["AWS"] = response["User"]["Arn"]
             print("- User already exists >>")
 
-            create_and_attach_user_policy(user_name)
+            put_ci_user_inline_policy(user_name)
+            print_completion()
 
         elif err.response['Error']['Code'] == 'InvalidClientTokenId':
             print("- Failed to create user, using defined Key & Secret for account {}!" \
-                  "\nMake sure its user has sufficient permission".format(ACCOUNTS["identity"]))
+                  "\n  Make sure its user has sufficient permission".format(ACCOUNTS["identity"]))
             abort_setup()
         else:
             print("- Unexpected error: %s" % err)
@@ -372,7 +411,7 @@ def get_account_alias(account_id):
         return response.get('AccountAliases', [account_id])[0]
 
 
-def create_role(target_account_id, account_alias, role_name, policy_arn):
+def create_role(target_account_id, account_alias, role_name, policy_arn=''):
     """
     Create terraform's read and write roles in all accounts
     :param target_account_id:
@@ -383,16 +422,20 @@ def create_role(target_account_id, account_alias, role_name, policy_arn):
     """
     try:
 
-        print('\nCreating role "{}" in account {} (ID: {})'.format(role_name, get_account_alias(target_account_id),
-                                                                   account_id))
+        print('Creating role "{}" in account {} (ID: {})'.format(
+            role_name,
+            get_account_alias(target_account_id),
+            target_account_id)
+        )
 
         if ARGS.dry_run:
             print(u'\u2023 Skipped during dry-run \u2023\u2023\u2023')
             return
 
-        assert 'AWS' in CI_ROLE_POLICY_DOC_TEMPLATE.get('Statement').get('Principal'), "Management user's ARN is not " \
-                                                                                       "injected! have you called create " \
-                                                                                       "user first? "
+        assert 'AWS' in CI_ROLE_POLICY_DOC_TEMPLATE.get('Statement').get('Principal'), \
+            "Management user's ARN is not " \
+            "injected! have you called create " \
+            "user first?"
 
         role = client("iam", target_account_id).create_role(
             AssumeRolePolicyDocument=json.dumps(CI_ROLE_POLICY_DOC_TEMPLATE),
@@ -400,10 +443,38 @@ def create_role(target_account_id, account_alias, role_name, policy_arn):
             RoleName=role_name,
         )
 
-        client("iam", target_account_id).attach_role_policy(
+        print(u'\u2A36 Wait for role to be created')
+        waiter = client("iam", target_account_id).get_waiter('role_exists')
+        waiter.wait(
             RoleName=role_name,
-            PolicyArn=policy_arn
+            WaiterConfig={
+                'Delay': 5,
+                'MaxAttempts': 10
+            }
         )
+
+        if role_name == DEFAULT_CI_ROLE_NAME:
+            print("- Attache {} policy".format(policy_arn))
+            client("iam", target_account_id).attach_role_policy(
+                RoleName=role_name,
+                PolicyArn=policy_arn
+            )
+        else:
+            print("- Put role's inline policy")
+
+            TERRAFORM_STATE_POLICY_DOC_TEMPLATE["Statement"][0]["Resource"] = "arn:aws:s3:::{}".format(S3_BUCKET_NAME)
+            TERRAFORM_STATE_POLICY_DOC_TEMPLATE["Statement"][1]["Resource"] = "arn:aws:s3:::{}/*".format(S3_BUCKET_NAME)
+            TERRAFORM_STATE_POLICY_DOC_TEMPLATE["Statement"][2]["Resource"] = "arn:aws:dynamodb:{}:{}:table/{}".format(
+                AWS_REGION,
+                target_account_id,
+                DEFAULT_TERRAFORM_BACKEND_DYNAMODB_TABLE_NAME
+            )
+
+            client("iam", target_account_id).put_role_policy(
+                RoleName=role_name,
+                PolicyName=DEFAULT_TERRAFORM_STATE_ROLE_NAME,
+                PolicyDocument=json.dumps(TERRAFORM_STATE_POLICY_DOC_TEMPLATE)
+            )
 
         print_completion()
 
@@ -412,10 +483,12 @@ def create_role(target_account_id, account_alias, role_name, policy_arn):
     except ClientError as err:
         if err.response['Error']['Code'] == 'EntityAlreadyExists':
             print("- Role already exists >>")
+            print_completion()
         elif err.response['Error']['Code'] == 'InvalidClientTokenId':
             print("- Failed to create user, using defined Key & Secret for account {}!" \
-                  "\nMake sure its user has sufficient permission".format(account_alias))
+                  "\n  Make sure its user has sufficient permission".format(account_alias))
         else:
+            raise err
             print("Unexpected error: %s" % err)
 
 
@@ -431,6 +504,13 @@ create_user(USERNAME)
 for account, account_id in ACCOUNTS.items():
     if account in ["organization"]:
         continue
+
+    if account in ["management"]:
+        create_role(
+            target_account_id=account_id,
+            account_alias=account,
+            role_name=DEFAULT_TERRAFORM_STATE_ROLE_NAME
+        )
 
     create_role(
         target_account_id=account_id,
