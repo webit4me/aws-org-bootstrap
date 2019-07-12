@@ -102,6 +102,12 @@ PARSER.add_argument(
 )
 
 PARSER.add_argument(
+    "-t", "--dynamodb-table-name",
+    help="DynamoDB table's name, required for terraform's remote lock, to be created on the management account",
+    default=DEFAULT_TERRAFORM_BACKEND_DYNAMODB_TABLE_NAME
+)
+
+PARSER.add_argument(
     "-u", "--username",
     help="A username to be created in the identity account",
     default=DEFAULT_CI_USERNAME
@@ -114,6 +120,7 @@ ORGANISATION_ACCESS_ROLE = ARGS.__getattribute__("role")
 ORGANISATION_PROFILE_NAME = ARGS.__getattribute__("organisation-admin-profile-name")
 ORG_SUB_ACCOUNT_IDS = ARGS.__getattribute__("org-sub-account-ids").split(",")
 S3_BUCKET_NAME = ARGS.__getattribute__("s3_bucket_name")
+DYNAMODB_TABLE_NAME = ARGS.__getattribute__("dynamodb_table_name")
 USERNAME = ARGS.__getattribute__("username")
 
 ACCOUNTS = {
@@ -275,7 +282,7 @@ def create_backend_bucket(bucket_name):
         return
 
     try:
-        client("s3", ACCOUNTS["management"]).create_bucket(
+        client('s3', ACCOUNTS["management"]).create_bucket(
             Bucket=bucket_name,
             CreateBucketConfiguration={'LocationConstraint': AWS_REGION}
         )
@@ -295,6 +302,56 @@ def create_backend_bucket(bucket_name):
             abort_setup()
         elif err.response['Error']['Code'] == 'BucketAlreadyOwnedByYou':
             print(u'\u2023 You already own this bucket')
+            print_completion()
+        else:
+            print("Unexpected error: %s" % err)
+            abort_setup()
+
+
+def create_dynamodb_table(table_name):
+    """ Create a S3 bucket in the provided management account to be used for terraform backend"""
+    target_account_id = ACCOUNTS["management"]
+    print('Creating DynamoDB\'s lock table "{}" in management account (ID: {})'.format(
+        table_name,
+        target_account_id
+    ))
+
+    if ARGS.dry_run:
+        print(u'\u2023 Skipped during dry-run \u2023\u2023\u2023')
+        return
+
+    try:
+        client('dynamodb', ACCOUNTS["management"]).create_table(
+            TableName=table_name,
+            KeySchema=[{'AttributeName': 'LockID', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'LockID', 'AttributeType': 'S'}],
+            # BillingMode='PAY_PER_REQUEST',
+            ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
+        )
+
+        print(u'\u2A36 Wait for role to be created')
+        waiter = client("dynamodb", target_account_id).get_waiter('table_exists')
+        waiter.wait(
+            TableName=table_name,
+            WaiterConfig={
+                'Delay': 5,
+                'MaxAttempts': 10
+            }
+        )
+
+        print_completion()
+    except ClientError as err:
+        if err.response['Error']['Code'] == 'ResourceInUseException':
+            print("- Table already exists >>")
+            print_completion()
+        elif err.response['Error']['Code'] == 'InvalidClientTokenId':
+            print("- Failed to create DynamoDB table, using defined Key & Secret for profile {}!" \
+                  "\n  Make sure its user has sufficient permission".format(target_account_id))
+            abort_setup()
+        elif err.response['Error']['Code'] == 'InvalidAccessKeyId':
+            print("- Failed to authenticate credentials provided by {} profile." \
+                  "\n  Make sure the Access keys is activated and credentials are valid.".format(target_account_id))
+            abort_setup()
         else:
             print("Unexpected error: %s" % err)
             abort_setup()
@@ -497,8 +554,6 @@ def create_role(target_account_id, account_alias, role_name, policy_arn=''):
 if ARGS.check_accounts:
     check_accounts()
 
-create_backend_bucket(S3_BUCKET_NAME)
-
 create_user(USERNAME)
 
 for account, account_id in ACCOUNTS.items():
@@ -506,6 +561,10 @@ for account, account_id in ACCOUNTS.items():
         continue
 
     if account in ["management"]:
+        create_backend_bucket(S3_BUCKET_NAME)
+
+        create_dynamodb_table(DYNAMODB_TABLE_NAME)
+
         create_role(
             target_account_id=account_id,
             account_alias=account,
